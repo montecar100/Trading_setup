@@ -1,0 +1,1 @@
+# mock 阶段无外部依赖；之后会加 pydantic, requests, logfire 等
