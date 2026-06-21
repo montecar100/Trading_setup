@@ -1,7 +1,25 @@
-.DS_Store
-.idea/
+# 密钥文件: 绝不进 repo
+adapter.py
+mt5_client.py
+pull_xau.py
+exposure_check_patch.py
+.env
+.env.*
+*.secret
+# VPS/本地测试脚本, 不属于 brain 部署
+dryrun_fx.py
+# 数据/研究产物
+*.csv
+*.parquet
+stale/
+research/
 __pycache__/
 *.pyc
-.env
-logs/
+# 本地环境
+venv/
+.venv/
+.DS_Store
 *.log
+# 运行时状态
+state.json
+.idea/

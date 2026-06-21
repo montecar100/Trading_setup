@@ -1,1 +1,5 @@
-# mock 阶段无外部依赖；之后会加 pydantic, requests, logfire 等
+# brain_fx 运行时依赖 (合并入口)
+requests>=2.31,<3
+numpy>=1.26,<3
+# L6 审计 (可选, 缺失时自动降级到 stdout logging — 见 brain_fx _llog)
+logfire>=0.30
