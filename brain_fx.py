@@ -207,6 +207,14 @@ def fx_usd_dedup_shrink(symbol, side, new_notional, positions_now):
         nv = notional_of(s, l, pr)
         net += usd_dir * nv
         gross += nv
+    # ── 首腿豁免 (与 _check_exposure_after 同源的修复) ──
+    # 组合此前没有任何 FX 腿 (gross==0) 时, 这单是当前美元方向的第一笔.
+    # 单腿自己的美元集中度数学上必然 100% (它就是全部 FX 敞口), 那不是"过度
+    # 单边", 是建仓必然. 不豁免的话每个美元方向的第一个 FX 单永远被缩到 0,
+    # 静默失败 → FX 三条腿全废. 只有已有 FX 持仓时才校验同向集中度.
+    if gross <= 1e-9:
+        return new_notional, None
+
     # 叠加这单
     this_usd_dir = USD_ROLE[symbol] * side
     net_after = net + this_usd_dir * new_notional
