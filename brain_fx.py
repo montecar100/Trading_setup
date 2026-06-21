@@ -763,6 +763,12 @@ def decide_and_act():
 
     positions = get_positions()
     pos_math, tickets = reconcile_positions(positions)
+    # 每 symbol 当前浮动盈亏 (平仓前快照, 用于 exit 事件记 realized_pnl 近似)
+    profit_by_symbol = {}
+    for _p in positions:
+        _s = _p.get("symbol")
+        if _s in SYMBOLS:
+            profit_by_symbol[_s] = float(_p.get("profit", 0.0))
     state = load_state()
 
     if HALT.is_set():
@@ -770,12 +776,15 @@ def decide_and_act():
 
     for symbol in SYMBOLS:
         try:
-            _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state)
+            _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state,
+                        profit_by_symbol)
         except Exception as e:
             log.error("decide " + symbol + " error: " + str(e))
 
 
-def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state):
+def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state,
+                profit_by_symbol=None):
+    profit_by_symbol = profit_by_symbol or {}
     p = zp(symbol)                                    # per-symbol z params + tf
     rates = get_rates(symbol, p.tf, max(p.zw + 5, 200))
     if not rates or len(rates) < p.zw + 1:
@@ -855,7 +864,9 @@ def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state):
             if flatten_symbol(symbol, side, lots):
                 if reason == "stop":
                     LAST_STOP_BAR[symbol] = GLOBAL_BAR_COUNTER[0]   # cooldown 起算
-                _llog("exit", symbol=symbol, reason=reason, z=round(z, 2),
+                _llog("exit", symbol=symbol, reason=reason,
+                      entry_z=round(entry_z, 2), exit_z=round(z, 2),
+                      bars_held=bars_held, pnl=round(profit_by_symbol.get(symbol, 0.0), 2),
                       bar=GLOBAL_BAR_COUNTER[0])
                 state.pop(symbol, None)
                 save_state(state)
@@ -893,6 +904,10 @@ def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state):
                                         pos_math, equity)
     if lots_ok <= 0:
         log.info(symbol + " entry rejected: " + ("; ".join(rej) if rej else "size 0"))
+        _llog("reject", symbol=symbol, z=round(z, 2),
+              side=("buy" if entry_side == 1 else "sell"),
+              gate="risk_check", reason=("; ".join(rej) if rej else "size 0"),
+              bar=GLOBAL_BAR_COUNTER[0])
         return
 
     # ── USD 方向去重 (FX 腿才生效; XAG 不在 USD_ROLE, 原样通过) ──
@@ -905,6 +920,10 @@ def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state):
         rej.append(dedup_reason)
         if lots_ok <= 0:
             log.info(symbol + " entry rejected after USD dedup")
+            _llog("reject", symbol=symbol, z=round(z, 2),
+                  side=("buy" if entry_side == 1 else "sell"),
+                  gate="usd_dedup", reason=dedup_reason,
+                  bar=GLOBAL_BAR_COUNTER[0])
             return
 
     side_str = "buy" if entry_side == 1 else "sell"
