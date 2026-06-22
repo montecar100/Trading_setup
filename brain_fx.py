@@ -111,14 +111,15 @@ USE_LOG_PRICE = os.environ.get("USE_LOG_PRICE", "1") == "1"
 # This |z|-band vs zero-cross difference is handled in _decide_one (见下).
 class ZP:
     __slots__ = ("zw", "ze", "z_exit", "max_hold", "stop_sigma",
-                 "use_log", "exit_mode", "tf")
+                 "use_log", "exit_mode", "tf", "z_cap")
 
     def __init__(self, zw, ze, z_exit, max_hold, stop_sigma, use_log, exit_mode,
-                 tf):
+                 tf, z_cap=0.0):
         self.zw = zw; self.ze = ze; self.z_exit = z_exit
         self.max_hold = max_hold; self.stop_sigma = stop_sigma
         self.use_log = use_log; self.exit_mode = exit_mode
         self.tf = tf                                  # per-symbol timeframe (M1/M5/...)
+        self.z_cap = z_cap        # 进场 |z| 上限 (0=不限). 极端 z 多为趋势突破,非回归
 
 # exit_mode: "zero_cross" (FX) | "abs_band" (XAG)
 # tf: FX 用 M5 (strategy_fx 验证周期); XAG 用 M1 (zw=60 根1min ≈ 1小时窗口).
@@ -128,10 +129,12 @@ Z_PARAMS = {
     "EURUSD": _FX_ZP,
     "GBPUSD": _FX_ZP,
     "USDJPY": _FX_ZP,
-    # XAG: 独立策略, 独立参数 + 独立周期. zw=60 根 M1 ≈ 1h, ze=2.0, |z|<0.6 平仓.
-    "XAGUSD": ZP(zw=60, ze=2.0, z_exit=0.6, max_hold=20, stop_sigma=5.0,
+    # XAG: 独立策略, 独立参数 + 独立周期. zw=60 根 M1 ≈ 1h.
+    # ze 2.0->2.3 (砍边缘 false positive); max_hold 20->30 (慢回归留时间,有硬止损兜底);
+    # z_cap=4.0 (极端 z 是趋势突破,不接刀).
+    "XAGUSD": ZP(zw=60, ze=2.3, z_exit=0.6, max_hold=30, stop_sigma=5.0,
                  use_log=True, exit_mode="abs_band",
-                 tf=os.environ.get("XAG_TF", "M1")),
+                 tf=os.environ.get("XAG_TF", "M1"), z_cap=4.0),
 }
 
 def zp(symbol):
@@ -154,6 +157,10 @@ LIQ_SIGMA_BAR = float(os.environ.get("LIQ_SIGMA_BAR", "0.001"))
 PORT_NOTIONAL_CAP = float(os.environ.get("PORT_NOTIONAL_CAP", "10.0"))  # gross/equity hard
 CB_DD_HALT = float(os.environ.get("CB_DD_HALT", "0.08"))   # account DD that trips CB
 CB_DD_SCALE = float(os.environ.get("CB_DD_SCALE", "0.05"))  # DD that halves new size
+
+# ── 单笔硬止损 (新增): 不看 z, 看浮亏. 专治 z 脱钩时风控瞎 ──
+# 单笔浮亏超过权益的此比例 -> 立即平仓. 落地 blueprint §6 的单笔风险封顶(1.5-2%).
+HARD_STOP_FRAC = float(os.environ.get("HARD_STOP_FRAC", "0.015"))
 
 # ── 轮次边界 (新增): 每日伦敦时间此小时为主办方 review / 轮次重置点 ──
 # 10pm 伦敦 = 22. 用 Europe/London 时区, 自动处理 BST(夏令时 UTC+1)/GMT.
@@ -555,7 +562,9 @@ def pre_trade_risk_check(symbol, side, requested_lots, entry_price, positions_no
             if sign_existing == side and (1.0 - NET_DIR_SOFT) > 0:
                 existing_gr = gross_existing()
                 max_new = (NET_DIR_SOFT * existing_gr - abs(net_signed)) / (1.0 - NET_DIR_SOFT)
-                max_new = max(0.0, max_new)
+                # 临时修复: 同向满仓时原公式必返负 -> 归零死循环. 放行至少现有规模的一半,
+                # 既打破死循环让多腿能建仓,又保留软上限不让无限堆同向.
+                max_new = max(existing_gr * 0.5, max_new)
                 requested_lots = min(requested_lots, max_new / (sp["contract"] * entry_price))
                 rej.append("net-dir " + format(frac, ".0%") + " -> shrink")
                 if requested_lots <= 0:
@@ -851,7 +860,12 @@ def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state,
                 reason = "revert"
             elif side == -1 and z <= p.z_exit:
                 reason = "revert"
-        # stop (z moved stop_sigma against entry) — same shape both strategies
+        # ── HARD STOP (新增): 不看 z, 看浮亏. z 脱钩时这是唯一有效的风控 ──
+        if reason is None:
+            cur_pnl = profit_by_symbol.get(symbol, 0.0)
+            if cur_pnl <= -(HARD_STOP_FRAC * equity):
+                reason = "hard_stop"
+        # stop (z moved stop_sigma against entry) — z 失灵时几乎不触发,留作冗余
         if reason is None:
             if side == 1 and z <= entry_z - p.stop_sigma:
                 reason = "stop"
@@ -885,6 +899,11 @@ def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state,
     elif z >= p.ze:
         entry_side = -1
     if entry_side == 0:
+        return
+    # ── z 上限 (新增): 极端 z 多为趋势突破,非均值回归,不进 ──
+    if p.z_cap > 0 and abs(z) > p.z_cap:
+        log.info(symbol + " entry skipped: |z|=" + format(abs(z), ".2f")
+                 + " > z_cap=" + format(p.z_cap, ".1f"))
         return
 
     if p.use_log:
