@@ -78,8 +78,13 @@ except Exception:
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-ADAPTER_URL = os.environ.get("ADAPTER_URL", "http://173.212.223.200:8000").rstrip("/")
-ADAPTER_SECRET = os.environ.get("ADAPTER_SECRET", "my-secret-key-12345")
+ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
+ADAPTER_SECRET = os.environ.get("ADAPTER_SECRET", "")
+# 公开 repo: 绝不硬编码 VPS IP / secret. 必须从环境变量注入, 缺失直接退出,
+# 避免 (a) 把 adapter 门牌+钥匙挂网上, (b) 静默连到错误/空地址跑一整轮.
+if not ADAPTER_URL or not ADAPTER_SECRET:
+    sys.stderr.write("FATAL: ADAPTER_URL / ADAPTER_SECRET 未设置 (环境变量). 拒绝启动.\n")
+    sys.exit(1)
 
 SYMBOLS = [s.strip().upper() for s in
            os.environ.get("SYMBOLS", "EURUSD,GBPUSD,USDJPY,XAGUSD").split(",") if s.strip()]
@@ -142,7 +147,7 @@ def zp(symbol):
 
 # risk (survival) params
 RISK_PER_TRADE = float(os.environ.get("RISK_PER_TRADE", "0.01"))
-MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "5.0"))
+MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "12.0"))
 MAX_LOTS = float(os.environ.get("MAX_LOTS", "5.0"))
 
 # competition hard limits
@@ -154,13 +159,31 @@ LIQ_BUFFER_BARS = int(os.environ.get("LIQ_BUFFER_BARS", "5"))
 LIQ_SIGMA_BAR = float(os.environ.get("LIQ_SIGMA_BAR", "0.001"))
 
 # portfolio-level caps + circuit breaker
-PORT_NOTIONAL_CAP = float(os.environ.get("PORT_NOTIONAL_CAP", "10.0"))  # gross/equity hard
+PORT_NOTIONAL_CAP = float(os.environ.get("PORT_NOTIONAL_CAP", "12.0"))  # gross/equity hard
 CB_DD_HALT = float(os.environ.get("CB_DD_HALT", "0.08"))   # account DD that trips CB
 CB_DD_SCALE = float(os.environ.get("CB_DD_SCALE", "0.05"))  # DD that halves new size
 
 # ── 单笔硬止损 (新增): 不看 z, 看浮亏. 专治 z 脱钩时风控瞎 ──
 # 单笔浮亏超过权益的此比例 -> 立即平仓. 落地 blueprint §6 的单笔风险封顶(1.5-2%).
 HARD_STOP_FRAC = float(os.environ.get("HARD_STOP_FRAC", "0.015"))
+
+# ── per-symbol 绝对美元止损 (新增): 比例止损在百万权益上太宽(0.015*1e6=15k),
+# 单笔亏到 -4865 都够不着 -> max_hold 强平吃掉利润. 这里加一个绝对美元下限,
+# 取 "比例" 与 "绝对" 里先触发的那个. XAG 波动大设 -800; FX 波动小设 -200(贴真实波动).
+# 不在表里的品种回退到 HARD_STOP_USD_DEFAULT.
+HARD_STOP_USD_DEFAULT = float(os.environ.get("HARD_STOP_USD_DEFAULT", "200.0"))
+HARD_STOP_USD = {
+    "XAGUSD": float(os.environ.get("HARD_STOP_USD_XAG", "800.0")),
+    "EURUSD": float(os.environ.get("HARD_STOP_USD_FX", "200.0")),
+    "GBPUSD": float(os.environ.get("HARD_STOP_USD_FX", "200.0")),
+    "USDJPY": float(os.environ.get("HARD_STOP_USD_FX", "200.0")),
+}
+
+def hard_stop_usd(symbol, equity):
+    """该 symbol 的单笔止损美元数 = min(绝对美元线, 比例线). 先触发者生效."""
+    abs_usd = HARD_STOP_USD.get(symbol, HARD_STOP_USD_DEFAULT)
+    frac_usd = HARD_STOP_FRAC * equity
+    return min(abs_usd, frac_usd)
 
 # ── 轮次边界 (新增): 每日伦敦时间此小时为主办方 review / 轮次重置点 ──
 # 10pm 伦敦 = 22. 用 Europe/London 时区, 自动处理 BST(夏令时 UTC+1)/GMT.
@@ -861,9 +884,10 @@ def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state,
             elif side == -1 and z <= p.z_exit:
                 reason = "revert"
         # ── HARD STOP (新增): 不看 z, 看浮亏. z 脱钩时这是唯一有效的风控 ──
+        # per-symbol 绝对美元线 (XAG -800 / FX -200), 与比例线取先触发者.
         if reason is None:
             cur_pnl = profit_by_symbol.get(symbol, 0.0)
-            if cur_pnl <= -(HARD_STOP_FRAC * equity):
+            if cur_pnl <= -hard_stop_usd(symbol, equity):
                 reason = "hard_stop"
         # stop (z moved stop_sigma against entry) — z 失灵时几乎不触发,留作冗余
         if reason is None:
@@ -876,7 +900,10 @@ def _decide_one(symbol, equity, trade_allowed, pos_math, tickets, state,
         if reason is not None:
             log.info(symbol + " exit (" + reason + ")")
             if flatten_symbol(symbol, side, lots):
-                if reason == "stop":
+                if reason in ("stop", "hard_stop"):
+                    # hard_stop 也进 cooldown: 否则 12x 下被 -800 平掉后下一根 bar
+                    # 信号还在会立刻重进 -> -800 × N 绞肉循环. z-stop 和现金止损
+                    # 都代表"这个方向刚被打脸", 都该冷静期.
                     LAST_STOP_BAR[symbol] = GLOBAL_BAR_COUNTER[0]   # cooldown 起算
                 _llog("exit", symbol=symbol, reason=reason,
                       entry_z=round(entry_z, 2), exit_z=round(z, 2),
